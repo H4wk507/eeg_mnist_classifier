@@ -9,8 +9,7 @@ Połączenie doświadczeń z dwóch projektów:
 
 from __future__ import annotations
 
-import time
-
+import mne
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +30,27 @@ def df_to_raw(df):
     y = df["label"].values.astype(np.int64)
     X = df.drop("label", axis=1).values.astype(np.float32).reshape(-1, 14, 256)
     return X, y
+
+
+def mne_preprocess(X, y, reject=True):
+    """X (N,14,256) surowe odczyty -> przefiltrowane. Zwraca (X, y) — zsynchronizowane,
+       bo drop_bad usuwa epoki."""
+    CH_NAMES = ['AF3','F7','F3','FC5','T7','P7','O1','O2','P8','T8','FC6','F4','F8','AF4']
+    SFREQ = 128.0
+    X = X.astype(np.float64)
+    X = X - X.mean(axis=2, keepdims=True)            # offset DC
+    X = X * 0.51e-6                                   # ADC -> wolty (próg 150µV musi mieć sens)
+    X = mne.filter.notch_filter(X, Fs=SFREQ, freqs=50.0, method='iir', verbose=False)
+    X = mne.filter.filter_data(X, sfreq=SFREQ, l_freq=1.0, h_freq=45.0, method='iir', verbose=False)
+
+    info = mne.create_info(CH_NAMES, SFREQ, ['eeg']*14)
+    info.set_montage(mne.channels.make_standard_montage('standard_1020'), match_case=False)
+    events = np.column_stack([np.arange(len(y)), np.zeros(len(y), int), (y + 1)])  # +1: unikamy kodu 0
+    ep = mne.EpochsArray(X, info, events=events, tmin=0.0, verbose=False)
+    ep.set_eeg_reference('average', verbose=False)
+    if reject:
+        ep.drop_bad(reject={'eeg': 150e-6}, verbose=False)
+    return ep.get_data(), ep.events[:, 2] - 1
 
 
 def filter_signal(X, fs=FS, band=(1.0, 40.0), order=4, baseline_ms=100.0):
@@ -64,6 +84,22 @@ def reject_mask(X, ptp_thresh, flat_eps=1e-6):
     flat = (std < flat_eps).any(axis=1)
     return ~(over | flat)
 
+def zscore_per_epoch(X):
+    """Z-score per kanał per epoka. (N, 14, 256) -> (N, 14, 256)."""
+    mean = X.mean(axis=2, keepdims=True)   # (N, 14, 1)
+    std = X.std(axis=2, keepdims=True) + 1e-8
+    return ((X - mean) / std).astype(np.float32)
+
+def crop(X, y, win_size, step):
+    xs = [X[:, :, st:st+win_size] for st in range(0, X.shape[2]-win_size+1, step)]
+    ys = [y for _ in range(len(xs))]
+    return np.concatenate(xs), np.concatenate(ys)
+
+def crop_grouped(X, win_size, step):                          # eval: okna + indeks epoki źródłowej
+    xs, idx = [], []
+    for st in range(0, X.shape[2]-win_size+1, step):
+        xs.append(X[:, :, st:st+win_size]); idx.append(np.arange(len(X)))
+    return np.concatenate(xs), np.concatenate(idx)
 
 def zscore_fit(X_train):
     """z-score per kanał — statystyki z train (brak wycieku z val/test)."""
@@ -170,7 +206,7 @@ def augment(x, max_shift=15, jitter=0.1, ch_drop=0.1):
 # --------------------------------------------------------------------------- #
 def make_loader(X, y, batch=128, shuffle=False):
     ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=0, pin_memory=True)
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=8, pin_memory=torch.cuda.is_available())
 
 
 @torch.no_grad()
@@ -183,9 +219,31 @@ def evaluate(model, loader, device):
     p, t = np.concatenate(preds), np.concatenate(trues)
     return p, accuracy_score(t, p), f1_score(t, p, average="macro")
 
+@torch.no_grad()
+def eval_grouped(model, X, y, device, bs, win_size, step):   # uśrednia predykcje okien per epoka
+    model.eval()
+    Xw, idx = crop_grouped(X, win_size, step)
+    Xw = torch.tensor(Xw, dtype=torch.float32)
+    probs = np.zeros((len(X), 10))
+    for i in range(0, len(Xw), bs):
+        p = torch.softmax(model(Xw[i:i+bs].to(device)), 1).cpu().numpy()
+        np.add.at(probs, idx[i:i+bs], p)
+    pred = probs.argmax(1)
+    return pred, accuracy_score(y, pred), f1_score(y, pred, average="macro")
 
-def train_model(model, train_loader, val_loader, device, *, epochs=25, lr=1e-3,
-                weight_decay=1e-4, patience=5, time_budget_s=300, use_augment=True,
+@torch.no_grad()
+def get_embeddings(model, loader, device):
+    """Wyciąga embeddingi z przedostatniej warstwy."""
+    model.eval()
+    embs, labels = [], []
+    for xb, yb in loader:
+        embs.append(model.embed(xb.to(device)).cpu().numpy())
+        labels.append(yb.numpy())
+    return np.concatenate(embs), np.concatenate(labels)
+
+
+def train_model(model, train_loader, val_loader, device, *, epochs=80, lr=1e-3,
+                weight_decay=1e-4, patience=20, use_augment=True,
                 log_every=0):
     """Adam + cosine LR + early stopping na val macro-F1 + twardy limit czasu.
 
@@ -194,13 +252,14 @@ def train_model(model, train_loader, val_loader, device, *, epochs=25, lr=1e-3,
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = nn.CrossEntropyLoss()
+
     hist = {"train_loss": [], "train_acc": [], "val_acc": [], "val_f1": []}
     best_f1, best_state, waited = -1.0, None, 0
-    t0 = time.time()
 
     for ep in range(1, epochs + 1):
         model.train()
         run_loss, run_correct, run_n = 0.0, 0, 0
+
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             if use_augment:
@@ -232,9 +291,59 @@ def train_model(model, train_loader, val_loader, device, *, epochs=25, lr=1e-3,
             if waited >= patience:
                 print(f"  early stop @ epoch {ep} (best val_f1={best_f1:.3f})")
                 break
-        if time.time() - t0 > time_budget_s:
-            print(f"  time budget hit @ epoch {ep} ({time.time()-t0:.0f}s)")
-            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, hist
+
+def train_model_grouped(model, train_loader, X_val, y_val, device, bs, win_size, step, *, epochs=80, lr=1e-3,
+                weight_decay=1e-4, patience=20, use_augment=True, log_every=0):
+    """Adam + cosine LR + early stopping na GRUPOWANYM val macro-F1.
+    train_loader: pocięte okna (model z n_time=WIN).
+    X_val/y_val: PEŁNE epoki (256), z-score per epoka, NIE pocięte.
+    Zwraca (model z najlepszymi wagami, history).
+    """
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    crit = nn.CrossEntropyLoss()
+    hist = {"train_loss": [], "train_acc": [], "val_acc": [], "val_f1": []}
+    best_f1, best_state, waited = -1.0, None, 0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        run_loss, run_correct, run_n = 0.0, 0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            if use_augment:
+                xb = augment(xb)
+            opt.zero_grad()
+            out = model(xb)
+            loss = crit(out, yb)
+            loss.backward()
+            opt.step()
+            run_loss += loss.item() * len(xb)
+            run_correct += (out.argmax(1) == yb).sum().item()
+            run_n += len(xb)
+        sched.step()
+
+        # walidacja per epoka (uśrednia okna), spójna z testem
+        _, val_acc, val_f1 = eval_grouped(model, X_val, y_val, device, bs, win_size, step)
+        hist["train_loss"].append(run_loss / run_n)
+        hist["train_acc"].append(run_correct / run_n)
+        hist["val_acc"].append(val_acc)
+        hist["val_f1"].append(val_f1)
+        if log_every and (ep % log_every == 0 or ep == 1):
+            print(f"  ep {ep:02d}  train_acc={hist['train_acc'][-1]:.3f}  "
+                  f"val_acc={val_acc:.3f}  val_f1={val_f1:.3f}")
+
+        if val_f1 > best_f1:
+            best_f1, waited = val_f1, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            waited += 1
+            if waited >= patience:
+                print(f"  early stop @ epoch {ep} (best val_f1={best_f1:.3f})")
+                break
 
     if best_state is not None:
         model.load_state_dict(best_state)

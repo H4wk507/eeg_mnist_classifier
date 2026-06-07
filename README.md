@@ -1,5 +1,7 @@
 # EEG MNIST Classifier
 
+Classifying MNIST digits from EEG data.
+
 ## Installation
 
 1. Install `uv` package manager:
